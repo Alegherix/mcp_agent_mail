@@ -603,6 +603,68 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             for name in ("x-forwarded-for", "x-forwarded-proto", "x-forwarded-host", "forwarded")
         )
 
+    @staticmethod
+    def _extract_bearer_token(auth_header: str) -> str | None:
+        """Return the token portion of an ``Authorization: Bearer <token>`` header.
+
+        Returns ``None`` when the header is missing or malformed. The caller is
+        responsible for any constant-time comparison against expected values —
+        this helper only tokenises the header.
+        """
+        if not auth_header:
+            return None
+        parts = auth_header.split(None, 1)
+        if len(parts) != 2 or parts[0].lower() != "bearer":
+            return None
+        token = parts[1].strip()
+        return token or None
+
+    async def _resolve_agent_for_bearer(
+        self, token: str
+    ) -> tuple[int, str, int, str] | None:
+        """Look up an agent by its registration token.
+
+        Returns ``(agent_id, agent_name, project_id, project_human_key)`` on a
+        constant-time match, or ``None`` if no agent (or DB error) matched.
+
+        Mailbox/DB failures here MUST NOT bubble up as HTTP 500s — the safe
+        default is to fall through to the unauthorized branch.
+        """
+        if not token or len(token) > 64:
+            return None
+        try:
+            async with get_session() as session:
+                # Pull all token-bearing agents so the comparison itself is
+                # constant-time. The index on `registration_token` keeps this
+                # bounded; the deployed server has at most a few dozen agents
+                # per project, which is fast even when we iterate all of them.
+                rows = await session.execute(
+                    text(
+                        "SELECT agents.id, agents.name, agents.project_id, agents.registration_token, "
+                        "projects.human_key "
+                        "FROM agents JOIN projects ON projects.id = agents.project_id "
+                        "WHERE agents.registration_token IS NOT NULL"
+                    )
+                )
+                fetched = rows.fetchall()
+        except Exception:
+            # Best-effort DB lookup; never expose a panic to the HTTP surface.
+            return None
+        match: tuple[int, str, int, str] | None = None
+        for row in fetched:
+            agent_id, agent_name, project_id, stored_token, project_human_key = (
+                row[0], row[1], row[2], row[3], row[4],
+            )
+            if not stored_token:
+                continue
+            if hmac.compare_digest(str(stored_token), token):
+                # Do NOT break: keep iterating so timing stays uniform. The
+                # first match wins; collisions on 32-byte tokens are
+                # effectively impossible.
+                if match is None:
+                    match = (int(agent_id), str(agent_name), int(project_id), str(project_human_key or ""))
+        return match
+
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
         if request.method == "OPTIONS":  # allow CORS preflight
             return await call_next(request)
@@ -616,9 +678,26 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         auth_header = request.headers.get("Authorization", "")
         expected_header = f"Bearer {self._token}"
         # Use constant-time comparison to prevent timing attacks
-        if not hmac.compare_digest(auth_header, expected_header):
-            return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
-        return await call_next(request)
+        if self._token and hmac.compare_digest(auth_header, expected_header):
+            return await call_next(request)
+
+        # Per-agent registration tokens: allow an MCP session to pre-bind via
+        # `Authorization: Bearer <agent_registration_token>` so the spawned
+        # CLI does not have to thread the same token through every tool call.
+        # The middleware records identity hints on `request.state` and lets
+        # the tool layer's `_authenticate_agent` finish the binding.
+        candidate = self._extract_bearer_token(auth_header)
+        if candidate is not None:
+            resolved = await self._resolve_agent_for_bearer(candidate)
+            if resolved is not None:
+                agent_id, agent_name, project_id, project_human_key = resolved
+                request.state.agent_id = agent_id
+                request.state.agent_name = agent_name
+                request.state.project_id = project_id
+                request.state.project_human_key = project_human_key
+                return await call_next(request)
+
+        return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
 
 
 def _localhost_bypass_allowed(request: Request, *, allow_localhost: bool) -> bool:

@@ -4873,10 +4873,58 @@ def build_mcp_server() -> FastMCP:
         bindings.add((project_id, agent_id))
         current_agents[project_id] = agent_id
 
+    def _http_request_agent_identity(ctx: Context) -> tuple[int, int] | None:
+        """Return (project_id, agent_id) when the active HTTP request was
+        authenticated as an agent by ``BearerAuthMiddleware``.
+
+        Returns ``None`` for stdio sessions, requests without a bound agent
+        identity, or when state lookups fail for any reason. Mailbox failures
+        must NEVER surface as 500s — callers fall back to the existing
+        registration-token path on ``None``.
+        """
+        try:
+            request = ctx.get_http_request()
+        except Exception:
+            return None
+        state = getattr(request, "state", None)
+        if state is None:
+            return None
+        agent_id = getattr(state, "agent_id", None)
+        project_id = getattr(state, "project_id", None)
+        if not isinstance(agent_id, int) or not isinstance(project_id, int):
+            return None
+        return project_id, agent_id
+
+    def _try_bind_from_http_auth(
+        ctx: Context, project: Project, agent: Agent
+    ) -> bool:
+        """Bind this session to ``agent`` when the HTTP middleware already
+        identified the same (project, agent) via Bearer authentication.
+
+        Returns ``True`` when a binding was created (or already exists),
+        ``False`` when the request was not bearer-authed as this identity.
+        """
+        if project.id is None or agent.id is None:
+            return False
+        identity = _http_request_agent_identity(ctx)
+        if identity is None:
+            return False
+        bound_project_id, bound_agent_id = identity
+        if bound_project_id != project.id or bound_agent_id != agent.id:
+            return False
+        _bind_session_agent(ctx, project, agent)
+        return True
+
     def _session_is_bound_to_agent(ctx: Context, project: Project, agent: Agent) -> bool:
         if project.id is None or agent.id is None:
             return False
-        return (project.id, agent.id) in _session_bindings_for(ctx)
+        if (project.id, agent.id) in _session_bindings_for(ctx):
+            return True
+        # First request on a brand-new HTTP session: middleware identified the
+        # agent via Bearer header but the in-memory binding table has not yet
+        # been populated for this `ctx.session_id`. Treat the middleware hint
+        # as proof of identity and lazily bind now.
+        return _try_bind_from_http_auth(ctx, project, agent)
 
     async def _resolve_session_agent_for_project(
         ctx: Context,
@@ -4896,6 +4944,19 @@ def build_mcp_server() -> FastMCP:
         ]
         if len(bound_agent_ids) == 1:
             return await _get_agent_by_id(project, bound_agent_ids[0])
+
+        # Last resort: middleware-attached Bearer identity for the same
+        # project. This catches the "first tool call on a brand-new HTTP
+        # session" case where the in-memory binding table has not yet been
+        # populated for this ctx.session_id.
+        identity = _http_request_agent_identity(ctx)
+        if identity is not None:
+            bound_project_id, bound_agent_id = identity
+            if bound_project_id == project.id:
+                with suppress(NoResultFound):
+                    agent = await _get_agent_by_id(project, bound_agent_id)
+                    _bind_session_agent(ctx, project, agent)
+                    return agent
         return None
 
     async def _authenticate_agent(
