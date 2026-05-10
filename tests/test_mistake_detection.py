@@ -227,3 +227,37 @@ class TestDetectSuspiciousFileReservation:
         result = _detect_suspicious_file_reservation("//some/pattern")
         # Should not trigger absolute path warning
         assert result is None or "absolute" not in result.lower()
+
+
+# ============================================================================
+# Regression: bead OneTUI-xlv3 — helper behaviour is unchanged.
+# The bug fix lives in send_message (roster-first lookup before the
+# heuristic). The helper itself must still flag role-ish handles, so the
+# unregistered-typo guard keeps working.
+# ============================================================================
+
+
+class TestRosterFirstHelperUnchanged:
+    """The helper keeps its descriptive-name behaviour after the xlv3 fix."""
+
+    def test_b_agent_still_flagged(self):
+        """Bare 'b-agent' shape should still be flagged by the helper.
+
+        send_message now SKIPS the helper for registered recipients, but the
+        helper itself remains a typo guard for unregistered names.
+        """
+        result = _detect_agent_name_mistake("b-agent")
+        assert result is not None
+        assert result[0] == "DESCRIPTIVE_NAME"
+
+    def test_unknown_agent_still_flagged(self):
+        """Hyphenated 'unknown-agent' shape stays a heuristic hit."""
+        result = _detect_agent_name_mistake("unknown-agent")
+        assert result is not None
+        assert result[0] == "DESCRIPTIVE_NAME"
+
+    def test_mailbox_epic_integrator_still_flagged(self):
+        """Long role-ish handles seen in OneTUI agent worktrees stay flagged."""
+        result = _detect_agent_name_mistake("mailbox-epic-integrator")
+        assert result is not None
+        assert result[0] == "DESCRIPTIVE_NAME"

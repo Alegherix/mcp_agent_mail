@@ -6911,7 +6911,13 @@ def build_mcp_server() -> FastMCP:
                 data={"argument": "to", "received_type": type(to).__name__},
             )
 
-        # Check for common recipient mistakes and provide helpful guidance
+        # Check for common recipient mistakes and provide helpful guidance.
+        # IMPORTANT: roster-check BEFORE the role-name heuristic (bead OneTUI-xlv3).
+        # The heuristic in _detect_agent_name_mistake rejects names with descriptive
+        # suffixes (e.g. "b-agent", "mailbox-epic-integrator"), but those handles
+        # are legitimate explicit identities once registered. If a recipient is
+        # already in the project roster we trust the roster and skip the heuristic;
+        # the existing recipient-existence checks further down still run.
         for recipient in to:
             if not isinstance(recipient, str):
                 raise ToolExecutionError(
@@ -6920,6 +6926,12 @@ def build_mcp_server() -> FastMCP:
                     recoverable=True,
                     data={"argument": "to", "invalid_item": repr(recipient)},
                 )
+            # Roster-first: if this name resolves to an agent in the current
+            # project, do not run the descriptive-name heuristic. Keep the
+            # heuristic active for unregistered names (typo guard).
+            roster_hit = await _find_agent_optional(project, recipient)
+            if roster_hit is not None:
+                continue
             mistake = _detect_agent_name_mistake(recipient)
             if mistake:
                 raise ToolExecutionError(

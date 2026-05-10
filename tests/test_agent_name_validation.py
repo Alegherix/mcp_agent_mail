@@ -678,3 +678,132 @@ class TestAgentNameEdgeCases:
         namespace_size = num_adjectives * num_nouns
         # Should have at least 4000 combinations (62 x 69 = 4278 per the comment)
         assert namespace_size >= 4000, f"Namespace too small: {namespace_size}"
+
+
+# ============================================================================
+# Regression: bead OneTUI-xlv3 — roster-check BEFORE role-name heuristic
+# in send_message. Registered explicit-IDs that happen to match descriptive
+# suffixes (e.g. "b-agent", "mailbox-epic-integrator") must NOT be rejected
+# as "descriptive role name" once they exist on the project roster.
+# ============================================================================
+
+
+def test_helper_still_flags_role_ish_handle_unchanged():
+    """The helper itself must remain a positive flag for role-ish handles.
+
+    The fix lives in send_message (roster check before the heuristic),
+    NOT in the helper. The helper's behaviour must not regress: an
+    unregistered ``b-agent`` shape is still a 'descriptive name' candidate.
+    """
+    from mcp_agent_mail.app import _detect_agent_name_mistake
+
+    result = _detect_agent_name_mistake("b-agent")
+    assert result is not None, "_detect_agent_name_mistake('b-agent') must still flag the shape"
+    assert result[0] == "DESCRIPTIVE_NAME"
+
+
+@pytest.mark.asyncio
+async def test_send_message_accepts_registered_role_ish_recipient(isolated_env):
+    """send_message must succeed when the recipient is registered, even
+    if its name shape matches the descriptive-role-name heuristic.
+
+    Regression for the bug confirmed at app.py:6923 — the heuristic ran
+    before the project roster lookup, so legitimate handles like
+    ``b-agent`` (registered via OneTUI per-agent worktrees) were rejected.
+    """
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/test/xlv3-roster"})
+
+        # Register sender (auto-name)
+        sender_result = await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/test/xlv3-roster",
+                "program": "test",
+                "model": "test",
+            },
+        )
+        sender_name = sender_result.data["name"]
+
+        # Register a recipient whose explicit identity matches the
+        # descriptive-name heuristic ("agent" suffix).
+        recipient_result = await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/test/xlv3-roster",
+                "program": "test",
+                "model": "test",
+                "name": "b-agent",
+            },
+        )
+        recipient_name = recipient_result.data["name"]
+        assert recipient_name == "b-agent", (
+            "register_agent should accept 'b-agent' as an explicit identity; "
+            f"got: {recipient_name!r}"
+        )
+
+        # Send_message must NOT reject this with DESCRIPTIVE_NAME — the
+        # recipient is on the project roster.
+        result = await client.call_tool(
+            "send_message",
+            {
+                "project_key": "/test/xlv3-roster",
+                "sender_name": sender_name,
+                "to": ["b-agent"],
+                "subject": "xlv3 roundtrip",
+                "body_md": "Roster-check should win over the role-name heuristic.",
+            },
+        )
+
+        assert result.data["count"] == 1
+        deliveries = result.data["deliveries"]
+        assert len(deliveries) == 1
+        # Confirm the message persisted with a row id.
+        payload = deliveries[0].get("payload", {})
+        assert payload.get("id"), "delivered message must have a persisted id"
+
+
+@pytest.mark.asyncio
+async def test_send_message_unregistered_role_ish_still_rejected(isolated_env):
+    """The typo-guard half of the heuristic must STILL fire for unregistered
+    recipients that match the descriptive-name shape.
+
+    This is the safety net the heuristic exists for: an agent that mistypes
+    or invents a role-shaped name (with no matching roster entry) should
+    get the helpful DESCRIPTIVE_NAME error instead of a generic 'not
+    registered' deep in the recipient resolver.
+    """
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool(
+            "ensure_project", {"human_key": "/test/xlv3-unregistered"}
+        )
+
+        sender_result = await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/test/xlv3-unregistered",
+                "program": "test",
+                "model": "test",
+            },
+        )
+        sender_name = sender_result.data["name"]
+
+        with pytest.raises(Exception) as exc_info:
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "/test/xlv3-unregistered",
+                    "sender_name": sender_name,
+                    "to": ["unknown-agent"],  # not registered + role-ish shape
+                    "subject": "Should fail",
+                    "body_md": "Heuristic must still guard typos.",
+                },
+            )
+
+        error_msg = str(exc_info.value).lower()
+        assert "descriptive" in error_msg, (
+            "Unregistered role-shaped recipient must still hit the "
+            f"DESCRIPTIVE_NAME guard; got: {error_msg!r}"
+        )
